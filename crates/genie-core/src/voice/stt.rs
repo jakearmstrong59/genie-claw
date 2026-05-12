@@ -414,6 +414,10 @@ impl SttEngine {
 /// device, resetting any kernel-side state.
 async fn flush_mic_buffer(device: &str, sample_rate: u32) {
     let flush_path = format!("/tmp/geniepod-flush-{}.wav", std::process::id());
+    // Use -c 2 (stereo) for the same reason as the real capture: -c 1 on the
+    // Tegra/LyraT plughw stack returns samples in half real time, so a 1 s
+    // mono flush actually drains only ~0.5 s of pending audio. Stereo keeps
+    // arecord properly throttled.
     let _ = Command::new("arecord")
         .args([
             "-D",
@@ -424,7 +428,7 @@ async fn flush_mic_buffer(device: &str, sample_rate: u32) {
             "-r",
             &sample_rate.to_string(),
             "-c",
-            "1",
+            "2",
             "-d",
             "1",
             &flush_path,
@@ -453,6 +457,15 @@ pub async fn record_audio(device: &str, sample_rate: u32, duration_secs: u32) ->
         "recording audio via arecord"
     );
 
+    // Capture STEREO (`-c 2`) even though whisper wants mono. On Tegra ALSA
+    // (Jetson Orin Nano APE card with the LyraT I2S2 frontend at 24 kHz),
+    // asking arecord for `-c 1` triggers a plughw rate-bug: it returns the
+    // requested number of mono samples but in HALF the wall-clock time, as
+    // if it interprets each stereo frame as two mono samples instead of
+    // downmixing. A 3-second `arecord -c 1 -r 24000 -d 3` finishes in 1.5 s
+    // and the recorded audio is timing-distorted. Capturing native stereo
+    // and downmixing to mono in the sox stage below gives clean 3-second
+    // real-time captures with correct sample timing.
     let output = Command::new("arecord")
         .args([
             "-D",
@@ -462,7 +475,7 @@ pub async fn record_audio(device: &str, sample_rate: u32, duration_secs: u32) ->
             "-r",
             &sample_rate.to_string(),
             "-c",
-            "1",
+            "2",
             "-d",
             &duration_secs.to_string(),
             &wav_path,
@@ -515,6 +528,13 @@ pub async fn record_audio(device: &str, sample_rate: u32, duration_secs: u32) ->
         .args([
             wav_path.as_str(),
             normalized_path.as_str(),
+            // Downmix stereo (captured by arecord -c 2 above) to mono. sox's
+            // `channels 1` effect averages all input channels into one — for
+            // a stereo LyraT capture this is mathematically the same as a
+            // passive broadside delay-and-sum beamformer pointed at the
+            // speaker.
+            "channels",
+            "1",
             "highpass",
             "100",
             "lowpass",

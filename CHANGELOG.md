@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 1.0.0-alpha.5 - 2026-05-11
+
+Alpha 5 is the voice-frontend release. It takes GenieClaw from a chat/HTTP
+appliance to a working **push-to-talk loop on Jetson hardware**: ESP32-LyraT
+V4.3 microphones in over I2S, USB headphone out for TTS, `whisper.cpp` on
+CUDA for sub-second STT, `llama.cpp` for the LLM, Piper for synthesis. The
+deploy story is hermetic — one `make deploy` cross-compiles the aarch64
+binaries on a Linux build host, ships everything via SSH to the Jetson, and
+`setup-jetson.sh` audits voice prerequisites before enabling services. The
+LyraT-on-Jetson install slice lives in `doc/lyrat-jetson-audio.md`; full
+hardware bring-up (firmware, wiring, Jetson-IO overlay, byte-exact
+verification) is in the companion `ai-hardware-engineer-roadmap` guide.
+
 ### Added
 
 - Jetson APE/I2S2 audio frontend support. `genie-audio.service` now runs
@@ -37,6 +50,42 @@
   voice-loop invocation fail mysteriously. The `geniepod.target` symlink
   is also created so every `WantedBy=geniepod.target` service auto-starts
   on boot.
+- New `[core].audio_output_device` config field. `genie-core` now uses
+  separate ALSA devices for capture (`audio_device`) and playback
+  (`audio_output_device`), so a LyraT-on-I2S2 input can pair with a USB
+  headphone output. Both default to `"auto"` and resolve through
+  `detect-audio-device.sh`; the helper now accepts an `--output` flag and
+  uses different priority orders for each side.
+- `genie-core` now passes the `language` form field to whisper-server in
+  server mode (`SttEngine::transcribe_via_server`), so `stt_language` in
+  the config actually reaches the server-mode decoder instead of being
+  silently dropped. Combined with the new English-only default
+  (`stt_language = "en"`), this measurably improved transcription accuracy.
+- `record_audio` now captures stereo (`-c 2`) and downmixes to mono in the
+  sox preprocessing stage. Works around a Tegra ALSA `plughw` timing bug
+  where `-c 1` returns the requested mono frame count in roughly half the
+  wall-clock time (interpreting stereo frames as paired mono samples
+  instead of downmixing them), causing the recorder to capture only a
+  fraction of the requested duration of real-world audio.
+- `record_audio`'s sox chain now does `channels 1 -> highpass 100 -> lowpass
+  7000 -> gain -n -3`. Band-passing the speech band before peak-normalize
+  prevents the ES8388 ADC's high-frequency noise floor from dominating the
+  spectrum after gain stage. `gain -n -3` then peak-normalizes the cleaned
+  signal to -3 dBFS so whisper sees nominal speech-level audio. Also
+  saves `/tmp/geniepod-last-rec.wav` as a fixed-path debug copy so
+  operators can `aplay` a recent capture without chasing PID-keyed paths.
+- `flush_mic_buffer` is now actually called from `record_audio` (it was
+  defined but unused). Drains the ALSA DMA capture queue and re-opens
+  the I2S device between cycles so consecutive push-to-talk cycles produce
+  independent captures instead of one polluting the next with TTS bleed
+  or kernel-side carry-over.
+- `transcribe_via_server` also sends `temperature = 0.0` and an explicit
+  empty `prompt` form field, defending the decoder against any future
+  whisper.cpp server version that might cache prior context.
+- `make deploy-config` now force-overwrites `/etc/geniepod/geniepod.toml`
+  on the target (was `cp -n`). The repo config is now the single source
+  of truth for layout/path/policy knobs; secrets stay in env vars
+  (`HA_TOKEN`, `TELEGRAM_BOT_TOKEN`) as documented inline.
 
 ### Changed
 
@@ -52,6 +101,44 @@
   enrollment and matching through `genie-ctl speaker`.
 - Speaker profile management now supports live microphone enrollment, WAV
   recording, and profile removal from `genie-ctl`.
+- Default `[core]` knobs flipped for the alpha.5 voice-on narrative:
+  `voice_enabled` `false -> true`, `wakeword_script` `<wake-listener>
+  -> ""` (push-to-talk default), `whisper_port` `0 -> 8178` (server
+  mode), `whisper_model` `ggml-small.bin` (with whisper-server keeping it
+  GPU-resident, the per-call cost is amortized away), `audio_sample_rate`
+  `48000 -> 24000` (match the LyraT I2S2 wire LRCK), `voice_record_secs`
+  `5 -> 3` (most household commands fit in 3 s), `stt_language` `"auto"
+  -> "en"` (English-only decoder is noticeably more accurate than
+  multilingual for English speech).
+- Tool-summary system prompt in `voice_loop.rs` rewritten from
+  "Summarize the tool result in one natural sentence for voice." to a
+  prompt that demands 5-10-word conversational replies and explicitly
+  forbids machine phrases ("tool result", "the tool indicates"), shaving
+  ~5 s off the typical voice-cycle TTS playback.
+
+### Known issues / tracked for alpha.6
+
+- LyraT firmware (`espressif/esp-adf` `examples/recorder/lyrat_jp4_passthrough/`)
+  is configured for 48 kHz I2S but emits 24 kHz LRCK on the JP4 wire on
+  the ESP32-LyraT V4.3. Workaround in alpha.5 is to set the Jetson AHUB
+  `I2S2 Sample Rate` to match (24 kHz, done by `genie-audio-init`).
+  Root cause is likely an APLL/MCLK divider or slot-width fallback in
+  the ESP-IDF I2S clock generator.
+- STT latency on `whisper-server` (ggml-small) varies between ~270 ms
+  (cold path, no LLM activity) and ~3.6 s (after a heavy LLM
+  generation) on Orin Nano's shared 7.6 GB iGPU. Suspected cause:
+  `llama-server`'s KV-cache growth evicts whisper's model pages.
+  Mitigation options (not yet implemented): pin whisper memory, force
+  whisper to CPU (slower but consistent), or schedule STT and LLM
+  inferences sequentially.
+- LLM cold-start on first `genie-llm.service` request takes ~30-60 s
+  while Phi-4-mini-Q4_K_M loads into iGPU memory. After that the model
+  stays hot. A pre-warm step (one `curl /completion` after service
+  start) is documented but not yet automated.
+- `record_audio` wall-clock duration is ~6.8 s for a `-d 3` request due
+  to Tegra ALSA arecord init/teardown overhead. Captured data is
+  byte-exact and timing-correct (3 s of 24 kHz stereo); only the user-
+  perceived "ready for next cycle" latency is affected.
 
 ## 1.0.0-alpha.4 - 2026-04-25
 
